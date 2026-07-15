@@ -1,0 +1,27 @@
+注册JWT 相关操作说明 ：  只有60秒时间，不能直接在ssh 中粘贴jwt 有1080个字符，会断行造成错误。用下面的命令模板
+
+浏览器打开 https://<团队域名>.cloudflareaccess.com/warp 完成认证
+F12 控制台输入 console.log(document.querySelector("meta[http-equiv='refresh']").content.split("=")[2])
+复制 JWT
+立刻粘贴到 SSH 执行以下命令（全部一起粘贴）：
+
+
+#############################################################################################################
+cat > /tmp/jwt.txt << 'EOF'
+粘贴JWT
+EOF
+
+JWT=$(cat /tmp/jwt.txt)
+
+echo "y" | usque register -c /etc/usque/socks5.json --accept-tos --jwt "$JWT" --name Rbox-socks
+
+echo "y" | usque register -c /etc/usque/nativetun.json --accept-tos --jwt "$JWT" --name Rbox-nativetun
+
+rm -f /tmp/jwt.txt
+
+/etc/init.d/usque restart
+
+ps | grep usque
+#############################################################################################################
+关键：从复制 JWT 到粘贴执行，必须在 60 秒内完成。建议先在浏览器准备好控制台，SSH 窗口准备好命令，只留 JWT 空位，最后一步粘贴 JWT 后立即全部执行。
+
