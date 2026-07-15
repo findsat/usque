@@ -1,0 +1,202 @@
+cat > /etc/init.d/usque << 'EOF_USQUE_INIT'
+#!/bin/sh /etc/rc.common
+
+# =========================================================================
+# 模块名称: usque (Cloudflare WARP/ZeroTrust 隧道 MASQUE协议)
+# 适用场景: OpenWrt 生产环境 (旁路网关/主路由)，完美兼容 Passwall
+# =========================================================================
+
+START=95
+STOP=10
+USE_PROCD=1 # 强制使用 procd 管理进程
+
+# ========== [配置区：请根据实际网络环境修改] ==========
+# 1. 物理/逻辑出口接口 (重要！)
+# 旁路由(如rv,rm)通常填 br-lan；主路由拨号通常填 pppoe-wan 或 eth1
+WAN_IF="br-lan"
+
+# 2. SOCKS5 代理配置 (供 Passwall 调用的节点)
+SOCKS5_PORT="10800"
+SOCKS5_BIND="127.0.0.1" # 限制本机访问更安全
+# SOCKS5_USER=""        # 如需密码取消注释并填写
+# SOCKS5_PASS=""
+
+# 3. 基础服务参数
+ZT_SNI="zt-masque.cloudflareclient.com"
+CONFIG_DIR="/etc/usque"
+BIN="/usr/bin/usque"
+
+# 4. 运行环境配置 (使用内存盘保护路由器 Flash 闪存)
+RUN_DIR="/var/run/usque"
+ROUTE_SCRIPT="${RUN_DIR}/on-connect.sh"
+DISCONNECT_SCRIPT="${RUN_DIR}/on-disconnect.sh"
+WATCHDOG_SCRIPT="${RUN_DIR}/watchdog.sh"
+
+# 5. 心跳间隔 (模拟官方客户端保持在线状态，不触发密钥重签)
+# 建议 5 分钟 (5m)，最低不要低于 3 分钟以免被 Cloudflare API 限流
+HEARTBEAT_INTERVAL="5m"
+
+# ========== [首次注册教程 (SSH 中执行)] ==========
+# 1. mkdir -p /etc/usque
+# 2. 浏览器登录 https://<团队域名>.cloudflareaccess.com/warp
+# 3. 在成功页面按 F12 打开控制台输入：
+#    console.log(document.querySelector("meta[http-equiv='refresh']").content.split("=")[2])
+#    复制打印出的一长串 JWT Token。
+# 4. 注册并生成配置文件 (自行修改 --name 参数)：
+#    usque register -c /etc/usque/socks5.json --accept-tos --jwt "<你的JWT>" --name Rbox-socks
+#    usque register -c /etc/usque/nativetun.json --accept-tos --jwt "<你的JWT>" --name Rbox-nativetun
+# ==================================================
+
+# =========================================================================
+# 核心函数: 接管本机 DNS 防污染
+# =========================================================================
+setup_dns_bypass() {
+    # 强制清理旧记录，并将域名绑定到 Cloudflare 全球静态 Anycast IP
+    # 彻底绕过 Passwall 的 DNS 劫持和 GFW 污染，实现拔号即连
+    sed -i '/zt-masque.cloudflareclient.com/d' /etc/hosts
+    echo "162.159.198.2 zt-masque.cloudflareclient.com #usque-bypass" >> /etc/hosts
+
+    # 兼容性升级: 同时通知 Dnsmasq 和 SmartDNS 热重载 Hosts
+    [ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq reload 2>/dev/null
+    [ -x /etc/init.d/smartdns ] && /etc/init.d/smartdns reload 2>/dev/null
+}
+
+cleanup_dns_bypass() {
+    # 停止服务时自动清理 Hosts 记录，保持系统纯净
+    sed -i '/usque-bypass/d' /etc/hosts
+    [ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq reload 2>/dev/null
+    [ -x /etc/init.d/smartdns ] && /etc/init.d/smartdns reload 2>/dev/null
+}
+
+# =========================================================================
+# 核心函数: 动态生成运行脚本 (储存于 RAM 中)
+# =========================================================================
+generate_scripts() {
+    mkdir -p "$RUN_DIR"
+
+    # 1. TUN 网卡连通时的防火墙放行策略 (Site-to-Site 基础)
+    cat > "$ROUTE_SCRIPT" << 'EOF'
+#!/bin/sh
+nft insert rule inet fw4 forward iifname "usque0" accept 2>/dev/null
+nft insert rule inet fw4 forward oifname "usque0" accept 2>/dev/null
+nft insert rule inet fw4 input iifname "usque0" accept 2>/dev/null
+# 如需三地内网互通，在此处添加远端路由，例如：
+# ip route add 192.168.88.0/24 dev usque0
+EOF
+    chmod +x "$ROUTE_SCRIPT"
+
+    # 2. TUN 网卡断开时的清理策略
+    cat > "$DISCONNECT_SCRIPT" << 'EOF'
+#!/bin/sh
+nft delete rule inet fw4 forward iifname "usque0" accept 2>/dev/null
+nft delete rule inet fw4 forward oifname "usque0" accept 2>/dev/null
+nft delete rule inet fw4 input iifname "usque0" accept 2>/dev/null
+# ip route del 192.168.88.0/24 dev usque0 2>/dev/null
+EOF
+    chmod +x "$DISCONNECT_SCRIPT"
+
+    # 3. IPv6 漂移监控看门狗 (独立守护进程)
+    #    仅负责 IPv6 变化时执行 enroll 刷新配置
+    #    心跳保活已交给独立的 heartbeat 守护进程，不再需要定时 enroll
+    cat > "$WATCHDOG_SCRIPT" << EOF
+#!/bin/sh
+LAST_IPV6=""
+while true; do
+    sleep 60
+    # 获取 WAN 接口所有有效的全球单播 IPv6 地址
+    CUR_IPV6=\$(ip -6 addr show "$WAN_IF" scope global -deprecated 2>/dev/null | grep 'inet6' | awk '{print \$2}' | sort | tr '\n' ' ')
+
+    [ -z "\$LAST_IPV6" ] && LAST_IPV6="\$CUR_IPV6"
+
+    # 当 IPv6 发生变化时，自动重新获取证书以维持隧道存活
+    if [ "\$CUR_IPV6" != "\$LAST_IPV6" ] && [ -n "\$CUR_IPV6" ]; then
+        logger -t usque-watchdog "检测到 $WAN_IF 的 IPv6 发生变化，正在执行 enroll 刷新..."
+
+        "$BIN" enroll -c "${CONFIG_DIR}/nativetun.json" 2>/dev/null
+        "$BIN" enroll -c "${CONFIG_DIR}/socks5.json" 2>/dev/null
+
+        LAST_IPV6="\$CUR_IPV6"
+
+        logger -t usque-watchdog "重签完毕，杀死当前进程，由 procd 自动拉起加载新配置..."
+        # 绝招：不调用 init.d restart 造成死锁，直接杀进程触发 respawn
+        killall usque 2>/dev/null
+    fi
+done
+EOF
+    chmod +x "$WATCHDOG_SCRIPT"
+}
+
+# =========================================================================
+# 启动/停止主逻辑
+# =========================================================================
+start_service() {
+    if [ ! -f "${CONFIG_DIR}/socks5.json" ] || [ ! -f "${CONFIG_DIR}/nativetun.json" ]; then
+        logger -t usque "错误: 配置文件缺失，请先运行注册命令！"
+        return 1
+    fi
+
+    # 1. 接管 DNS 防污染
+    setup_dns_bypass
+
+    # 2. 生成运行脚本至内存
+    generate_scripts
+
+    # 3. 启动实例 A: SOCKS5 代理 (供 Passwall 调用的节点)
+    procd_open_instance "usque_socks5"
+    # 若配置了账号密码，加入 -u 和 -w 参数
+    # procd_set_param command "$BIN" socks -s "$ZT_SNI" -b "$SOCKS5_BIND" -p "$SOCKS5_PORT" -u "$SOCKS5_USER" -w "$SOCKS5_PASS" -c "${CONFIG_DIR}/socks5.json"
+    procd_set_param command "$BIN" socks -s "$ZT_SNI" -b "$SOCKS5_BIND" -p "$SOCKS5_PORT" -c "${CONFIG_DIR}/socks5.json"
+    procd_set_param respawn 3600 5 10 # 崩溃后等待 5 秒重启，最高重启 10 次
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    # 4. 启动实例 B: Native TUN (内网通信 Mesh)
+    procd_open_instance "usque_tun"
+    procd_set_param command "$BIN" nativetun -s "$ZT_SNI" -n usque0 -c "${CONFIG_DIR}/nativetun.json" --on-connect "$ROUTE_SCRIPT" --on-disconnect "$DISCONNECT_SCRIPT"
+    procd_set_param respawn 3600 5 10
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    # 5. 启动实例 C: 心跳守护进程 - SOCKS5 (模拟官方客户端保活)
+    #    轻量级 GET 请求，不重新注册密钥，不中断隧道
+    procd_open_instance "usque_hb_socks5"
+    procd_set_param command "$BIN" heartbeat -c "${CONFIG_DIR}/socks5.json" --interval "$HEARTBEAT_INTERVAL"
+    procd_set_param respawn 3600 5 0 # 心跳进程无限重启
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    # 6. 启动实例 D: 心跳守护进程 - Native TUN
+    procd_open_instance "usque_hb_tun"
+    procd_set_param command "$BIN" heartbeat -c "${CONFIG_DIR}/nativetun.json" --interval "$HEARTBEAT_INTERVAL"
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    # 7. 启动实例 E: IPv6 看门狗 (仅 IPv6 变化时 enroll)
+    procd_open_instance "usque_watchdog"
+    procd_set_param command "$WATCHDOG_SCRIPT"
+    procd_set_param respawn 3600 5 0 # Watchdog 支持无限次自动重启
+    procd_close_instance
+
+    logger -t usque "服务启动完成，SOCKS5 监听于 $SOCKS5_BIND:$SOCKS5_PORT，隧道网卡为 usque0，心跳间隔 $HEARTBEAT_INTERVAL"
+}
+
+stop_service() {
+    cleanup_dns_bypass
+    rm -rf "$RUN_DIR"
+    logger -t usque "服务已停止，DNS 接管及临时文件已清理"
+}
+
+service_triggers() {
+    procd_add_reload_trigger "usque"
+}
+EOF_USQUE_INIT
+
+# 赋予可执行权限并重启服务
+chmod +x /etc/init.d/usque
+/etc/init.d/usque enable
+/etc/init.d/usque restart
