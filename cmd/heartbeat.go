@@ -14,7 +14,7 @@ var heartbeatCmd = &cobra.Command{
 	Short: "Send a heartbeat to keep the device alive in Zero Trust dashboard",
 	Long: "Sends a lightweight API request to Cloudflare to update the device's last-seen timestamp.\n" +
 		"Can run as a daemon with --interval to periodically send heartbeats.\n" +
-		"Unlike enroll, this does not regenerate keys or disrupt the tunnel.",
+		"Unlike enroll, this does not save config or restart the tunnel.",
 	Run: func(cmd *cobra.Command, args []string) {
 		if !config.ConfigLoaded {
 			cmd.Println("Config not loaded. Please register first.")
@@ -27,28 +27,25 @@ var heartbeatCmd = &cobra.Command{
 		}
 
 		if interval == 0 {
-			// Single heartbeat mode
-			if err := api.Heartbeat(config.AppConfig.ID, config.AppConfig.AccessToken); err != nil {
+			if err := api.Heartbeat(config.AppConfig.ID, config.AppConfig.AccessToken, config.AppConfig.PrivateKey); err != nil {
 				log.Fatalf("Heartbeat failed: %v", err)
 			}
 			log.Println("Heartbeat successful")
 			return
 		}
 
-		// Daemon mode — send heartbeat periodically
 		log.Printf("Starting heartbeat daemon, interval: %s", interval)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		// Send immediately on start
-		if err := api.Heartbeat(config.AppConfig.ID, config.AppConfig.AccessToken); err != nil {
+		if err := api.Heartbeat(config.AppConfig.ID, config.AppConfig.AccessToken, config.AppConfig.PrivateKey); err != nil {
 			log.Printf("Heartbeat failed: %v", err)
 		} else {
 			log.Println("Heartbeat successful")
 		}
 
 		for range ticker.C {
-			if err := api.Heartbeat(config.AppConfig.ID, config.AppConfig.AccessToken); err != nil {
+			if err := api.Heartbeat(config.AppConfig.ID, config.AppConfig.AccessToken, config.AppConfig.PrivateKey); err != nil {
 				log.Printf("Heartbeat failed: %v", err)
 			}
 		}
