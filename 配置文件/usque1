@@ -1,0 +1,128 @@
+cat > /etc/init.d/usque << 'EOF_USQUE_INIT'
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+WAN_IF="br-lan"
+SOCKS5_PORT="10800"
+SOCKS5_BIND="127.0.0.1"
+ZT_SNI="zt-masque.cloudflareclient.com"
+CONFIG_DIR="/etc/usque"
+BIN="/usr/bin/usque"
+
+RUN_DIR="/var/run/usque"
+ROUTE_SCRIPT="${RUN_DIR}/on-connect.sh"
+DISCONNECT_SCRIPT="${RUN_DIR}/on-disconnect.sh"
+WATCHDOG_SCRIPT="${RUN_DIR}/watchdog.sh"
+
+HEARTBEAT_INTERVAL="5m"
+
+setup_dns_bypass() {
+    sed -i '/zt-masque.cloudflareclient.com/d' /etc/hosts
+    echo "162.159.198.2 zt-masque.cloudflareclient.com #usque-bypass" >> /etc/hosts
+    [ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq reload 2>/dev/null
+    [ -x /etc/init.d/smartdns ] && /etc/init.d/smartdns reload 2>/dev/null
+}
+
+cleanup_dns_bypass() {
+    sed -i '/usque-bypass/d' /etc/hosts
+    [ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq reload 2>/dev/null
+    [ -x /etc/init.d/smartdns ] && /etc/init.d/smartdns reload 2>/dev/null
+}
+
+generate_scripts() {
+    mkdir -p "$RUN_DIR"
+
+    cat > "$ROUTE_SCRIPT" << 'EOF'
+#!/bin/sh
+nft insert rule inet fw4 forward iifname "usque0" accept 2>/dev/null
+nft insert rule inet fw4 forward oifname "usque0" accept 2>/dev/null
+nft insert rule inet fw4 input iifname "usque0" accept 2>/dev/null
+EOF
+    chmod +x "$ROUTE_SCRIPT"
+
+    cat > "$DISCONNECT_SCRIPT" << 'EOF'
+#!/bin/sh
+nft delete rule inet fw4 forward iifname "usque0" accept 2>/dev/null
+nft delete rule inet fw4 forward oifname "usque0" accept 2>/dev/null
+nft delete rule inet fw4 input iifname "usque0" accept 2>/dev/null
+EOF
+    chmod +x "$DISCONNECT_SCRIPT"
+
+    cat > "$WATCHDOG_SCRIPT" << EOF
+#!/bin/sh
+LAST_IPV6=""
+while true; do
+    sleep 60
+    CUR_IPV6=\$(ip -6 addr show "$WAN_IF" scope global -deprecated 2>/dev/null | grep 'inet6' | awk '{print \$2}' | sort | tr '\n' ' ')
+    [ -z "\$LAST_IPV6" ] && LAST_IPV6="\$CUR_IPV6"
+    if [ "\$CUR_IPV6" != "\$LAST_IPV6" ] && [ -n "\$CUR_IPV6" ]; then
+        logger -t usque-watchdog "检测到 IPv6 变化，执行 enroll..."
+        "$BIN" enroll -c "${CONFIG_DIR}/nativetun.json" 2>/dev/null
+        "$BIN" enroll -c "${CONFIG_DIR}/socks5.json" 2>/dev/null
+        LAST_IPV6="\$CUR_IPV6"
+        logger -t usque-watchdog "enroll 完成，杀死进程由 procd 拉起..."
+        killall usque 2>/dev/null
+    fi
+done
+EOF
+    chmod +x "$WATCHDOG_SCRIPT"
+}
+
+start_service() {
+    if [ ! -f "${CONFIG_DIR}/socks5.json" ] || [ ! -f "${CONFIG_DIR}/nativetun.json" ]; then
+        logger -t usque "错误: 配置文件缺失，请先执行 usque register 命令"
+        return 1
+    fi
+
+    setup_dns_bypass
+    generate_scripts
+
+    procd_open_instance "usque_socks5"
+    procd_set_param command "$BIN" socks -s "$ZT_SNI" -b "$SOCKS5_BIND" -p "$SOCKS5_PORT" -c "${CONFIG_DIR}/socks5.json"
+    procd_set_param respawn 3600 5 10
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    procd_open_instance "usque_tun"
+    procd_set_param command "$BIN" nativetun -s "$ZT_SNI" -n usque0 -c "${CONFIG_DIR}/nativetun.json" --on-connect "$ROUTE_SCRIPT" --on-disconnect "$DISCONNECT_SCRIPT"
+    procd_set_param respawn 3600 5 10
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    procd_open_instance "usque_hb_socks5"
+    procd_set_param command "$BIN" heartbeat -c "${CONFIG_DIR}/socks5.json" --interval "$HEARTBEAT_INTERVAL"
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    procd_open_instance "usque_hb_tun"
+    procd_set_param command "$BIN" heartbeat -c "${CONFIG_DIR}/nativetun.json" --interval "$HEARTBEAT_INTERVAL"
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    procd_open_instance "usque_watchdog"
+    procd_set_param command "$WATCHDOG_SCRIPT"
+    procd_set_param respawn 3600 5 0
+    procd_close_instance
+
+    logger -t usque "服务启动完成，SOCKS5: $SOCKS5_BIND:$SOCKS5_PORT，TUN: usque0，心跳: $HEARTBEAT_INTERVAL"
+}
+
+stop_service() {
+    cleanup_dns_bypass
+    rm -rf "$RUN_DIR"
+    logger -t usque "服务已停止"
+}
+
+service_triggers() {
+    procd_add_reload_trigger "usque"
+}
+EOF_USQUE_INIT
