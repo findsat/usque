@@ -1,0 +1,299 @@
+Cloudflare ASK AI 对话总结
+Cloudflare WARP/ZeroTrust + usque + OpenWrt 部署总结
+一、项目概述
+在 OpenWrt 路由器（旁路网关/主路由）上，通过第三方工具 usque 建立 Cloudflare WARP/Zero Trust 的 MASQUE 协议隧道，并完美兼容 Passwall 透明代理。
+
+二、解决的核心问题
+1. Cloudflare IP 段修正
+对照 Cloudflare 官方文档和 usque 实际配置文件，修正了脚本中的 IP 白名单：
+
+最终正确的 IP 配置：
+
+# IPv4: API 注册端点 + 官方 MASQUE 范围 + usque 实际隧道端点
+CF_IP4_RANGES="162.159.137.105 162.159.138.105 162.159.197.0/24 162.159.198.0/24"
+
+# IPv6: API 端点 + 官方 MASQUE 范围 + usque 实际隧道端点
+CF_IP6_RANGES="2606:4700:7::a29f:8969 2606:4700:7::a29f:8a69 2606:4700:102::/48 2606:4700:103::/48"
+Copy
+删除的错误/多余 IP 段：
+
+162.159.192.0/24（消费级 WARP，Zero Trust 不需要）
+162.159.193.0/24（WireGuard 协议）
+104.16.0.0/13（通用 CDN，范围过大）
+2606:4700:100::/48（WireGuard IPv6）
+保留的关键 IP 段：
+
+162.159.198.0/24（usque 实际端点 162.159.198.2）
+2606:4700:103::/48（usque 实际 IPv6 端点 2606:4700:103::2）
+2. Passwall 兼容架构
+采用"架构解耦"策略，与 Passwall 透明代理完美兼容：
+
+脚本放弃防火墙控制：不再用 nft/iptables 强写规则，避免与 Passwall 的 TPROXY (mangle 表) 冲突（EPERM 错误）
+放行工作交给 Passwall：将 Cloudflare WARP IP 段加入 Passwall 的"直连 IP 列表"（/usr/share/passwall/rules/direct_ip）
+DNS 防污染：脚本接管 /etc/hosts，将 zt-masque.cloudflareclient.com 绑定到 162.159.198.2，绕过 GFW DNS 污染和 Passwall DNS 劫持
+3. Zero Trust 后台"最后注册时间"不更新问题
+根本原因：usque 缺少官方客户端的"心跳"功能，普通隧道连接不会触发 API 通信，只有 enroll 命令才会更新服务器端时间戳。
+
+解决方案：从源码层面新增 heartbeat 命令，通过 GitHub Actions 在线编译。
+
+三、usque 源码修改与编译
+1. 新增 api/heartbeat.go
+实现轻量级 PATCH 请求（复用已有密钥，不重新生成）
+发送到 /reg/{deviceId} 端点，刷新设备"最后注册时间"
+不保存配置、不杀进程、不中断隧道
+// 核心逻辑：用已有私钥提取公钥，发送 PATCH 请求
+func Heartbeat(deviceId string, deviceToken string, privKeyPemBase64 string) error {
+    // 解码私钥 → 提取公钥 → 构造 PATCH 请求体 → 发送
+}
+Copy
+2. 新增 cmd/heartbeat.go
+支持单次模式（默认）和守护模式（--interval 参数）
+守护模式通过 time.Ticker 定时发送心跳
+3. GitHub Actions 编译
+文件：.github/workflows/build.yml
+支持 13 种架构交叉编译（linux/darwin/windows/freebsd × amd64/arm64/386/arm/mips 等）
+使用 CGO_ENABLED=0 纯 Go 静态编译，不依赖任何 C 库
+使用 -ldflags="-s -w" 去除调试符号，减小体积
+4. 编译排错
+遇到 undefined: json 错误：在 api/heartbeat.go 的 import 中添加 "encoding/json"
+遇到心跳不更新时间戳：将 GET 请求改为 PATCH 请求（GET 是只读操作，PATCH 才会更新服务器端时间戳）
+四、最终 init.d 脚本架构
+进程结构（5 个 procd 实例）
+实例	命令	作用
+usque_socks5	usque socks	SOCKS5 代理，供 Passwall 调用
+usque_tun	usque nativetun	TUN 隧道，用于内网 Mesh
+usque_hb_socks5	usque heartbeat --interval 5m	心跳守护（socks5 配置）
+usque_hb_tun	usque heartbeat --interval 5m	心跳守护（nativetun 配置）
+usque_watchdog	watchdog.sh	IPv6 变化监控
+关键设计决策
+心跳与隧道解耦：心跳只发 GET/PATCH 请求，不杀进程、不重写配置，隧道持续运行不受干扰
+Watchdog 回归纯 IPv6 监控：不再定时 enroll，只在 IPv6 变化时执行 enroll 刷新配置
+RAM Disk 保护闪存：所有动态脚本生成在 /var/run/usque/（内存盘），重启即焚
+procd respawn 机制：进程崩溃后自动重启，Watchdog 不调用 init.d restart 避免死锁
+心跳间隔 5 分钟：平衡 API 限流风险和后台时间新鲜度
+init.d 脚本完整代码
+#!/bin/sh /etc/rc.common
+
+# =========================================================================
+# 模块名称: usque (Cloudflare WARP/ZeroTrust 隧道 MASQUE协议)
+# 适用场景: OpenWrt 生产环境 (旁路网关/主路由)，完美兼容 Passwall
+# =========================================================================
+
+START=95
+STOP=10
+USE_PROCD=1
+
+# ========== [配置区：请根据实际网络环境修改] ==========
+WAN_IF="br-lan"
+SOCKS5_PORT="10800"
+SOCKS5_BIND="127.0.0.1"
+# SOCKS5_USER=""
+# SOCKS5_PASS=""
+
+ZT_SNI="zt-masque.cloudflareclient.com"
+CONFIG_DIR="/etc/usque"
+BIN="/usr/bin/usque"
+
+RUN_DIR="/var/run/usque"
+ROUTE_SCRIPT="${RUN_DIR}/on-connect.sh"
+DISCONNECT_SCRIPT="${RUN_DIR}/on-disconnect.sh"
+WATCHDOG_SCRIPT="${RUN_DIR}/watchdog.sh"
+
+HEARTBEAT_INTERVAL="5m"
+
+# ========== [首次注册教程 (SSH 中执行)] ==========
+# 1. mkdir -p /etc/usque
+# 2. 浏览器登录 https://<团队域名>.cloudflareaccess.com/warp
+# 3. 在成功页面按 F12 打开控制台输入：
+#    console.log(document.querySelector("meta[http-equiv='refresh']").content.split("=")[2])
+# 4. 用 WinSCP 将 JWT 上传到 /tmp/jwt.txt (避免 SSH 粘贴换行问题)
+# 5. 注册并生成配置文件：
+#    JWT=$(cat /tmp/jwt.txt | tr -d '\n')
+#    echo "y" | usque register -c /etc/usque/socks5.json --accept-tos --jwt "$JWT" --name Rbox-socks
+#    echo "y" | usque register -c /etc/usque/nativetun.json --accept-tos --jwt "$JWT" --name Rbox-nativetun
+#    rm -f /tmp/jwt.txt
+# ==================================================
+
+# =========================================================================
+# DNS 防污染
+# =========================================================================
+setup_dns_bypass() {
+    sed -i '/zt-masque.cloudflareclient.com/d' /etc/hosts
+    echo "162.159.198.2 zt-masque.cloudflareclient.com #usque-bypass" >> /etc/hosts
+    [ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq reload 2>/dev/null
+    [ -x /etc/init.d/smartdns ] && /etc/init.d/smartdns reload 2>/dev/null
+}
+
+cleanup_dns_bypass() {
+    sed -i '/usque-bypass/d' /etc/hosts
+    [ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq reload 2>/dev/null
+    [ -x /etc/init.d/smartdns ] && /etc/init.d/smartdns reload 2>/dev/null
+}
+
+# =========================================================================
+# 动态生成辅助脚本 (储存于 RAM 中)
+# =========================================================================
+generate_scripts() {
+    mkdir -p "$RUN_DIR"
+
+    cat > "$ROUTE_SCRIPT" << 'EOF'
+#!/bin/sh
+nft insert rule inet fw4 forward iifname "usque0" accept 2>/dev/null
+nft insert rule inet fw4 forward oifname "usque0" accept 2>/dev/null
+nft insert rule inet fw4 input iifname "usque0" accept 2>/dev/null
+# 如需组网(Site-to-Site)，在此处添加远端内网路由，例如：
+# ip route add 192.168.88.0/24 dev usque0
+EOF
+    chmod +x "$ROUTE_SCRIPT"
+
+    cat > "$DISCONNECT_SCRIPT" << 'EOF'
+#!/bin/sh
+nft delete rule inet fw4 forward iifname "usque0" accept 2>/dev/null
+nft delete rule inet fw4 forward oifname "usque0" accept 2>/dev/null
+nft delete rule inet fw4 input iifname "usque0" accept 2>/dev/null
+# ip route del 192.168.88.0/24 dev usque0 2>/dev/null
+EOF
+    chmod +x "$DISCONNECT_SCRIPT"
+
+    cat > "$WATCHDOG_SCRIPT" << EOF
+#!/bin/sh
+LAST_IPV6=""
+while true; do
+    sleep 60
+    CUR_IPV6=\$(ip -6 addr show "$WAN_IF" scope global -deprecated 2>/dev/null | grep 'inet6' | awk '{print \$2}' | sort | tr '\n' ' ')
+    [ -z "\$LAST_IPV6" ] && LAST_IPV6="\$CUR_IPV6"
+    if [ "\$CUR_IPV6" != "\$LAST_IPV6" ] && [ -n "\$CUR_IPV6" ]; then
+        logger -t usque-watchdog "检测到 $WAN_IF 的 IPv6 发生变化，执行 enroll..."
+        "$BIN" enroll -c "${CONFIG_DIR}/nativetun.json" 2>/dev/null
+        "$BIN" enroll -c "${CONFIG_DIR}/socks5.json" 2>/dev/null
+        LAST_IPV6="\$CUR_IPV6"
+        logger -t usque-watchdog "enroll 完成，杀死进程由 procd 拉起..."
+        killall usque 2>/dev/null
+    fi
+done
+EOF
+    chmod +x "$WATCHDOG_SCRIPT"
+}
+
+# =========================================================================
+# 启动/停止逻辑
+# =========================================================================
+start_service() {
+    if [ ! -f "${CONFIG_DIR}/socks5.json" ] || [ ! -f "${CONFIG_DIR}/nativetun.json" ]; then
+        logger -t usque "错误: 配置文件缺失，请先执行 usque register 命令"
+        return 1
+    fi
+
+    setup_dns_bypass
+    generate_scripts
+
+    procd_open_instance "usque_socks5"
+    procd_set_param command "$BIN" socks -s "$ZT_SNI" -b "$SOCKS5_BIND" -p "$SOCKS5_PORT" -c "${CONFIG_DIR}/socks5.json"
+    procd_set_param respawn 3600 5 10
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    procd_open_instance "usque_tun"
+    procd_set_param command "$BIN" nativetun -s "$ZT_SNI" -n usque0 -c "${CONFIG_DIR}/nativetun.json" --on-connect "$ROUTE_SCRIPT" --on-disconnect "$DISCONNECT_SCRIPT"
+    procd_set_param respawn 3600 5 10
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    procd_open_instance "usque_hb_socks5"
+    procd_set_param command "$BIN" heartbeat -c "${CONFIG_DIR}/socks5.json" --interval "$HEARTBEAT_INTERVAL"
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    procd_open_instance "usque_hb_tun"
+    procd_set_param command "$BIN" heartbeat -c "${CONFIG_DIR}/nativetun.json" --interval "$HEARTBEAT_INTERVAL"
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    procd_open_instance "usque_watchdog"
+    procd_set_param command "$WATCHDOG_SCRIPT"
+    procd_set_param respawn 3600 5 0
+    procd_close_instance
+
+    logger -t usque "服务启动完成，SOCKS5: $SOCKS5_BIND:$SOCKS5_PORT，TUN: usque0，心跳: $HEARTBEAT_INTERVAL"
+}
+
+stop_service() {
+    cleanup_dns_bypass
+    rm -rf "$RUN_DIR"
+    logger -t usque "服务已停止"
+}
+
+service_triggers() {
+    procd_add_reload_trigger "usque"
+}
+Copy
+五、Passwall 直连 IP 配置
+文件位置：/usr/share/passwall/rules/direct_ip
+
+114.114.114.114
+114.114.115.115
+223.5.5.5
+223.6.6.6
+119.29.29.29
+180.76.76.76
+1.12.12.12
+120.53.53.53
+180.184.1.1
+180.184.2.2
+162.159.137.105
+162.159.138.105
+162.159.197.0/24
+162.159.198.0/24
+2606:4700:7::a29f:8969
+2606:4700:7::a29f:8a69
+2606:4700:100::/48
+2606:4700:101::/48
+2606:4700:102::/48
+2606:4700:103::/48
+Copy
+六、部署注意事项
+JWT 获取与注册：
+JWT 有效期仅 60 秒，获取后必须立即执行注册
+SSH 粘贴 JWT 会因终端换行导致损坏，必须用 WinSCP 上传到 /tmp/jwt.txt
+读取时用 JWT=$(cat /tmp/jwt.txt | tr -d '\n') 去除所有换行符
+架构选择：
+X86-64 设备下载 usque-linux-amd64
+ARM64 设备下载 usque-linux-arm64
+MIPS 设备下载对应 usque-linux-mips*-softfloat
+验证方法：
+usque --help 确认包含 heartbeat 命令
+usque heartbeat -c /etc/usque/socks5.json 手动测试心跳
+ps | grep usque 确认 5 个进程运行
+Zero Trust 后台确认"最后注册时间"持续更新
+WARP Connector 限制：
+usque 无法模拟 WARP Connector（连接器），只能作为 WARP Client（设备）
+Connector 需要未公开的 API 端点和路由协商协议
+内网互通可通过 on-connect.sh 添加静态路由实现 WARP-to-WARP 通信
+官方客户端不兼容 OpenWrt：
+依赖 glibc（OpenWrt 用 musl libc）和 systemd（OpenWrt 用 procd）
+不是空间问题，是系统库不兼容
+usque 用 CGO_ENABLED=0 静态编译，零 C 库依赖，是 OpenWrt 上的最优解
+七、GitHub 仓库
+Fork 仓库：https://github.com/findsat/usque
+新增文件：
+api/heartbeat.go — 心跳 API 函数（PATCH 请求）
+cmd/heartbeat.go — 心跳子命令（支持 --interval 守护模式）
+.github/workflows/build.yml — GitHub Actions 全架构编译
+编译产物：Actions 页面下载对应架构的二进制文件
+
+
+
+Support
+Type @ to tag a resource or ? for shortcuts
+Ask
+
+
+支持
+系统状态
+招贤纳士
